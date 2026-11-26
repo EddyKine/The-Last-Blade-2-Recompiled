@@ -1,0 +1,45 @@
+
+[game]
+id = "thelastblade2"
+title = "The Last Blade 2 - Final Edition"
+region = "Japan"
+product = "T3107M"
+
+[disc]
+image = "Disc/game.gdi"
+
+[binary]
+path = "1ST_READ.BIN"
+load_address = 0x8C010000    # where the console's BIOS loads the file
+link_address = 0x0C010000    # the same RAM through a different address; what the code assumes
+entry = 0x8C010000           # the first instruction
+
+
+
+  [[relocations]]  # RAM 0x8c000000 reproduces image 0x0c14a114 for 52 bytes
+  source = 0x0C14A114
+  size = 0x34
+  dest = 0x8C000000
+  [[relocations]]  # RAM 0x8c000078 reproduces image 0x0c0bed20 for 57 bytes
+  source = 0x0C0BED20
+  size = 0x3C
+  dest = 0x8C000078
+  [[relocations]]  # RAM 0x8c000100 reproduces image 0x0c14a080 for 52 bytes
+  source = 0x0C14A080
+  size = 0x34
+  dest = 0x8C000100
+  [[relocations]]  # RAM 0x8c000400 reproduces image 0x0c14a080 for 52 bytes
+  source = 0x0C14A080
+  size = 0x34
+  dest = 0x8C000400
+  [[relocations]]  # RAM 0x8c000600 reproduces image 0x0c14a0b8 for 88 bytes
+  source = 0x0C14A0B8
+  size = 0x58
+  dest = 0x8C000600
+  [[relocations]]  # RAM 0x8c00f284 reproduces image 0x0c15f740 for 132 bytes
+  source = 0x0C15F740
+  size = 0x84
+  dest = 0x8C00F284
+
+[functions]
+extra = [0x0C074514, 0x0C0851DC, 0x0C04FA70, 0x0C0126FC, 0x0C012DC2, 0x0C012430]

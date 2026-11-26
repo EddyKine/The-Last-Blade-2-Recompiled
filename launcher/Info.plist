@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>es</string>
+  <key>CFBundleDisplayName</key><string>The Last Blade 2 Recompiled</string>
+  <key>CFBundleExecutable</key><string>TLB2Launcher</string>
+  <key>CFBundleIdentifier</key><string>cl.quintafotografica.tlb2recompiled.launcher26</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>The Last Blade 2 Recompiled</string>
+  <key>CFBundleIconFile</key><string>TLB2.icns</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.26</string>
+  <key>CFBundleVersion</key><string>26</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+</dict>
+</plist>

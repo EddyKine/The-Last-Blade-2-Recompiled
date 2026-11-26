@@ -1,0 +1,443 @@
+diff --git a/render/include/dream/render/vk/texture_cache.h b/render/include/dream/render/vk/texture_cache.h
+index 202f82e..8ae94af 100644
+--- a/render/include/dream/render/vk/texture_cache.h
++++ b/render/include/dream/render/vk/texture_cache.h
+@@ -66,6 +66,8 @@ public:
+     // shader is told not to sample, but Vulkan still wants a valid set bound, and a white texel
+     // means a stray sample changes nothing.
+     VkDescriptorSet fallback(VkCommandBuffer cmd);
++    void begin_upload_batch();
++    void end_upload_batch(VkCommandBuffer cmd);
+ 
+     std::size_t size() const noexcept { return entries_.size(); }
+ 
+@@ -74,6 +76,8 @@ public:
+     // freed without a device wait; the least recently used are evicted here when the cache is
+     // near the descriptor pool's limit.
+     void begin_frame();
++    // TLB2_GFX_V014: caller has waited for all geometry submissions.
++    void collect_completed();
+     std::uint32_t evicted = 0;
+     std::uint32_t decoded = 0, failed = 0, hits = 0;
+     // Host time in decode_texture and in upload (image, memory, staging, copy recording), for the
+@@ -106,7 +110,10 @@ private:
+         VkDescriptorSet set = VK_NULL_HANDLE;
+         HostBuffer staging;
+         TextureInfo info;
++        std::uint32_t recycle_w = 0, recycle_h = 0, recycle_levels = 0;
++        VkDeviceSize recycle_bytes = 0;
+         std::uint64_t last_frame = 0;
++        std::vector<std::uint8_t> tlb2_original_bytes;
+     };
+     // Per hardware key: what the key needs to know before the texture is decoded (dreamcomp).
+     struct Meta {
+@@ -130,9 +137,21 @@ private:
+     // still in flight can sample them, instead of a device-wide wait on every overwrite.
+     std::vector<std::pair<std::uint64_t, Entry>> retired_;
+     void free_retired(bool all);
++    std::vector<Entry> recycle_;
++    VkDeviceSize recycle_bytes_ = 0;
++    std::uint64_t recycle_hits_ = 0, recycle_misses_ = 0;
++    void clear_recycle();
++    bool take_recycled(Entry& e, std::uint32_t w, std::uint32_t h, std::uint32_t levels);
+     unsigned stage_slot_ = 0;
+     VkDeviceSize stage_used_ = 0;
+ 
++    struct PendingUpload {
++        VkBuffer source;
++        VkImageMemoryBarrier to_dst, to_read;
++        std::vector<VkBufferImageCopy> copies;
++    };
++    bool batching_ = false;
++    std::vector<PendingUpload> pending_uploads_;
+     void free_entry(Entry& e);
+     VkSampler sampler_for(std::uint32_t tsp, bool tiled);
+     // `width` x `height` is the image uploaded, which for a pack replacement is not the guest's
+diff --git a/render/src/vk/renderer.cpp b/render/src/vk/renderer.cpp
+index 4c03034..0ac4278 100644
+--- a/render/src/vk/renderer.cpp
++++ b/render/src/vk/renderer.cpp
+@@ -353,6 +353,7 @@ void Renderer::set_memory(const std::uint8_t* vram, std::size_t vram_size,
+ // recorded inside one. The descriptor sets are remembered for the draw that follows.
+ void Renderer::prepare(VkCommandBuffer upload, const Frame& frame) {
+     frame_sets_.clear();
++    textures_.begin_upload_batch();
+     fallback_set_ = textures_.fallback(upload);
+     // Two passes, because whether a texture is addressed with repeat or clamp is a property of
+     // every polygon that samples it, not of the first one seen. One strip that genuinely wraps is
+@@ -375,6 +376,7 @@ void Renderer::prepare(VkCommandBuffer upload, const Frame& frame) {
+         }
+     for (const auto& [key, u] : used)
+         frame_sets_[key] = textures_.get(upload, u.tcw, u.tsp, u.tiled);
++    textures_.end_upload_batch(upload);
+ }
+ 
+ void Renderer::draw(VkCommandBuffer cmd, const Frame& frame, const FrameGeometry& geometry,
+diff --git a/render/src/vk/texture_cache.cpp b/render/src/vk/texture_cache.cpp
+index 913c441..8889f6c 100644
+--- a/render/src/vk/texture_cache.cpp
++++ b/render/src/vk/texture_cache.cpp
+@@ -15,7 +15,7 @@ namespace dream::render::vk {
+ 
+ namespace {
+ 
+-constexpr std::uint32_t kMaxTextures = 2048;
++constexpr std::uint32_t kMaxTextures = 8192; // TLB2_GFX_V013
+ 
+ // Repeat and mirror only describe what happens outside the unit square. A polygon that never goes
+ // there cannot tell them apart from clamping at the guest's own resolution, and above it clamping
+@@ -82,13 +82,59 @@ void TextureCache::free_retired(bool all) {
+     retired_.resize(keep);
+ }
+ 
++// TLB2_GFX_V021: only collect after the caller's successful fence waits.
++void TextureCache::collect_completed() {
++    static const bool disabled = std::getenv("TLB2_NO_RECYCLE") != nullptr;
++    if (disabled) { free_retired(true); return; }
++    constexpr VkDeviceSize budget = 64ull << 20;
++    for (auto& item : retired_) {
++        auto& e = item.second;
++        if (e.image && e.memory && e.view && e.set && e.recycle_bytes &&
++            recycle_.size() < 2048 && e.recycle_bytes <= budget - recycle_bytes_) {
++            recycle_bytes_ += e.recycle_bytes;
++            e.staging.destroy();
++            e.tlb2_original_bytes.clear();
++            recycle_.push_back(std::move(e));
++        } else { free_entry(e); }
++    }
++    retired_.clear();
++}
++
++void TextureCache::clear_recycle() {
++    for (auto& e : recycle_) free_entry(e);
++    recycle_.clear();
++    recycle_bytes_ = 0;
++}
++
++bool TextureCache::take_recycled(Entry& e, std::uint32_t w, std::uint32_t h,
++                                 std::uint32_t levels) {
++    if (&e == &fallback_) return false;
++    for (std::size_t i = recycle_.size(); i > 0; --i) {
++        auto& r = recycle_[i - 1];
++        if (r.recycle_w != w || r.recycle_h != h || r.recycle_levels != levels) continue;
++        recycle_bytes_ -= r.recycle_bytes;
++        e.image = r.image; e.memory = r.memory; e.view = r.view; e.set = r.set;
++        e.recycle_w = w; e.recycle_h = h; e.recycle_levels = levels;
++        e.recycle_bytes = r.recycle_bytes;
++        if (i != recycle_.size()) r = std::move(recycle_.back());
++        recycle_.pop_back();
++        ++recycle_hits_;
++        return true;
++    }
++    ++recycle_misses_;
++    return false;
++}
++
+ void TextureCache::begin_frame() {
+     ++frame_;
+     stage_slot_ = (stage_slot_ + 1) % kStageSlots;
+     stage_used_ = 0;
+     free_retired(false);
+     // Leave headroom under the pool (kMaxTextures descriptor sets) for one frame's new textures.
+-    constexpr std::size_t kHigh = 1536, kLow = 1024;
++    // TLB2_GFX_V018: A/B test, preserve headroom for new textures.
++    static const bool expanded = std::getenv("TLB2_LRU_EXPANDED") != nullptr;
++    const std::size_t kHigh = expanded ? 4096 : 1536;
++    const std::size_t kLow = expanded ? 3072 : 1024;
+     if (entries_.size() < kHigh || !ctx_ || !ctx_->device())
+         return;
+     std::vector<std::pair<std::uint64_t, std::uint64_t>> age;  // last_frame, key
+@@ -112,6 +158,7 @@ void TextureCache::invalidate() {
+     for (auto& [key, e] : entries_) free_entry(e);
+     entries_.clear();
+     free_retired(true);
++    clear_recycle();
+ }
+ 
+ void TextureCache::free_entry(Entry& e) {
+@@ -160,8 +207,16 @@ std::size_t TextureCache::invalidate_range(std::uint32_t begin, std::uint32_t en
+         // not retried every frame, and a write cannot make it stale.
+         if (bytes == 0)
+             continue;
+-        if (lo < end && begin < lo + bytes)
++        if (lo < end && begin < lo + bytes) {
++            // TLB2_GFX_V014: dirty pages can include unchanged texture bytes.
++            // Exact comparison, not a hash; no skipping for unsupported layouts.
++            if (!rendered && e.set && !e.tlb2_original_bytes.empty() && vram_ &&
++                static_cast<std::size_t>(lo) + e.tlb2_original_bytes.size() <= vram_size_ &&
++                std::memcmp(vram_ + lo, e.tlb2_original_bytes.data(),
++                            e.tlb2_original_bytes.size()) == 0)
++                continue;
+             doomed.push_back(key);
++        }
+     }
+     if (doomed.empty())
+         return 0;
+@@ -252,6 +307,8 @@ bool TextureCache::upload(VkCommandBuffer cmd, Entry& e, const std::vector<std::
+         std::memcpy(dst + offsets[l], data.data(), data.size() * 4);
+     }
+ 
++    const bool reused = take_recycled(e, width, height, levels);
++    if (!reused) {
+     VkImageCreateInfo ici{};
+     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+     ici.imageType = VK_IMAGE_TYPE_2D;
+@@ -278,7 +335,11 @@ bool TextureCache::upload(VkCommandBuffer cmd, Entry& e, const std::vector<std::
+     mai.memoryTypeIndex = type;
+     if (vkAllocateMemory(ctx_->device(), &mai, nullptr, &e.memory) != VK_SUCCESS)
+         return false;
+-    vkBindImageMemory(ctx_->device(), e.image, e.memory, 0);
++    if (vkBindImageMemory(ctx_->device(), e.image, e.memory, 0) != VK_SUCCESS)
++        return false;
++    e.recycle_w = width; e.recycle_h = height; e.recycle_levels = levels;
++    e.recycle_bytes = req.size;
++    }
+ 
+     VkImageMemoryBarrier to_dst{};
+     to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+@@ -289,8 +350,7 @@ bool TextureCache::upload(VkCommandBuffer cmd, Entry& e, const std::vector<std::
+     to_dst.image = e.image;
+     to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
+     to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+-                         0, nullptr, 0, nullptr, 1, &to_dst);
++
+ 
+     std::vector<VkBufferImageCopy> copies(levels);
+     for (std::uint32_t l = 0; l < levels; ++l) {
+@@ -299,17 +359,24 @@ bool TextureCache::upload(VkCommandBuffer cmd, Entry& e, const std::vector<std::
+         copies[l].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+         copies[l].imageExtent = {std::max(1u, width >> l), std::max(1u, height >> l), 1};
+     }
+-    vkCmdCopyBufferToImage(cmd, source, e.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levels,
+-                           copies.data());
++
+ 
+     VkImageMemoryBarrier to_read = to_dst;
+     to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+     to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+     to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+     to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+-                         0, 0, nullptr, 0, nullptr, 1, &to_read);
++    if (batching_) {
++        pending_uploads_.push_back({source, to_dst, to_read, std::move(copies)});
++    } else {
++        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                             0, 0, nullptr, 0, nullptr, 1, &to_dst);
++        vkCmdCopyBufferToImage(cmd, source, e.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levels, copies.data());
++        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++                             0, 0, nullptr, 0, nullptr, 1, &to_read);
++    }
+ 
++    if (reused) return true;
+     VkImageViewCreateInfo vci{};
+     vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+     vci.image = e.image;
+@@ -321,6 +388,31 @@ bool TextureCache::upload(VkCommandBuffer cmd, Entry& e, const std::vector<std::
+     return true;
+ }
+ 
++void TextureCache::begin_upload_batch() {
++    batching_ = std::getenv("TLB2_NO_BATCH") == nullptr;
++    pending_uploads_.clear();
++}
++
++void TextureCache::end_upload_batch(VkCommandBuffer cmd) {
++    batching_ = false;
++    if (pending_uploads_.empty()) return;
++    std::vector<VkImageMemoryBarrier> before, after;
++    before.reserve(pending_uploads_.size());
++    after.reserve(pending_uploads_.size());
++    for (const auto& p : pending_uploads_) {
++        before.push_back(p.to_dst);
++        after.push_back(p.to_read);
++    }
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                         0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(before.size()), before.data());
++    for (const auto& p : pending_uploads_)
++        vkCmdCopyBufferToImage(cmd, p.source, p.to_dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                               static_cast<std::uint32_t>(p.copies.size()), p.copies.data());
++    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++                         0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(after.size()), after.data());
++    pending_uploads_.clear();
++}
++
+ VkDescriptorSet TextureCache::get(VkCommandBuffer cmd, std::uint32_t tcw, std::uint32_t tsp,
+                                   bool tiled) {
+     if (!vram_ || !ctx_)
+@@ -359,9 +451,21 @@ VkDescriptorSet TextureCache::get(VkCommandBuffer cmd, std::uint32_t tcw, std::u
+         return it->second.set;
+     }
+ 
++    auto tlb2_fail = [&](const char* reason) {
++        static unsigned counts[4] = {};
++        unsigned i = std::strcmp(reason, "describe") == 0 ? 0 :
++                     std::strcmp(reason, "decode") == 0 ? 1 :
++                     std::strcmp(reason, "upload") == 0 ? 2 : 3;
++        const unsigned n = ++counts[i];
++        if (n <= 12 || (n & (n - 1)) == 0)
++            std::fprintf(stderr, "TLB2_TEX_FAIL %s count=%u tcw=%08x tsp=%08x live=%zu retired=%zu\n",
++                         reason, n, static_cast<unsigned>(tcw), static_cast<unsigned>(tsp),
++                         entries_.size(), retired_.size());
++    };
+     Entry e;
+     e.last_frame = frame_;
+     if (!describe_texture(tcw, tsp, 0, e.info)) {
++        tlb2_fail("describe");
+         ++failed;
+         entries_.emplace(key, std::move(e));  // remember the failure so it is not retried per frame
+         return VK_NULL_HANDLE;
+@@ -406,6 +510,7 @@ VkDescriptorSet TextureCache::get(VkCommandBuffer cmd, std::uint32_t tcw, std::u
+             std::fprintf(stderr, "texture decode %.2f ms: %s\n", static_cast<double>(ns) * 1e-6,
+                          e.info.describe().c_str());
+         if (!decoded_ok) {
++            tlb2_fail("decode");
+             ++failed;
+             entries_.emplace(key, std::move(e));
+             return VK_NULL_HANDLE;
+@@ -454,6 +559,7 @@ VkDescriptorSet TextureCache::get(VkCommandBuffer cmd, std::uint32_t tcw, std::u
+     if (replacement && uploaded)
+         ++replacer_.replaced;
+     if (!uploaded) {
++        tlb2_fail("upload");
+         ++failed;
+         entries_.emplace(key, std::move(e));
+         return VK_NULL_HANDLE;
+@@ -465,11 +571,16 @@ VkDescriptorSet TextureCache::get(VkCommandBuffer cmd, std::uint32_t tcw, std::u
+     dsai.descriptorPool = pool_;
+     dsai.descriptorSetCount = 1;
+     dsai.pSetLayouts = &layout_;
+-    if (vkAllocateDescriptorSets(ctx_->device(), &dsai, &e.set) != VK_SUCCESS) {
++    if (!e.set && vkAllocateDescriptorSets(ctx_->device(), &dsai, &e.set) != VK_SUCCESS) {
++        clear_recycle();
++        e.set = VK_NULL_HANDLE;
++        if (vkAllocateDescriptorSets(ctx_->device(), &dsai, &e.set) != VK_SUCCESS) {
++        tlb2_fail("descriptor");
+         ++failed;
+         error_ = "the descriptor pool is exhausted";
+         entries_.emplace(key, std::move(e));
+         return VK_NULL_HANDLE;
++        }
+     }
+     VkDescriptorImageInfo image{};
+     image.sampler = e.sampler;
+@@ -483,6 +594,15 @@ VkDescriptorSet TextureCache::get(VkCommandBuffer cmd, std::uint32_t tcw, std::u
+     write.pImageInfo = &image;
+     vkUpdateDescriptorSets(ctx_->device(), 1, &write, 0, nullptr);
+ 
++    // Snapshot only simple, bounded layouts. Palette changes remain part of the cache key.
++    static const bool compare_bytes = std::getenv("TLB2_NO_BYTE_COMPARE") == nullptr;
++    const auto tlb2_bytes = e.info.size_bytes();
++    if (compare_bytes && !e.info.mipmapped && !e.info.vq && !e.info.stride &&
++        tlb2_bytes && tlb2_bytes <= 65536 &&
++        static_cast<std::size_t>(e.info.address) + tlb2_bytes <= vram_size_) {
++        e.tlb2_original_bytes.assign(vram_ + e.info.address,
++                                     vram_ + e.info.address + tlb2_bytes);
++    }
+     ++decoded;
+     VkDescriptorSet set = e.set;
+     entries_.emplace(key, std::move(e));
+@@ -523,6 +643,10 @@ VkDescriptorSet TextureCache::fallback(VkCommandBuffer cmd) {
+ void TextureCache::destroy() {
+     if (!ctx_ || !ctx_->device())
+         return;
++    std::fprintf(stderr, "TLB2_RECYCLE hits=%llu misses=%llu idle=%zu bytes=%llu\n",
++                 static_cast<unsigned long long>(recycle_hits_),
++                 static_cast<unsigned long long>(recycle_misses_), recycle_.size(),
++                 static_cast<unsigned long long>(recycle_bytes_));
+     invalidate();
+     if (fallback_.view)
+         vkDestroyImageView(ctx_->device(), fallback_.view, nullptr);
+diff --git a/runtime/boot/boot_main.cpp b/runtime/boot/boot_main.cpp
+index d0fab39..a6cf9e4 100644
+--- a/runtime/boot/boot_main.cpp
++++ b/runtime/boot/boot_main.cpp
+@@ -443,6 +443,15 @@ struct Live {
+             ++backgrounds;
+         for (auto* e : dream::host::extensions()) e->on_frame(decoder.frame());
+         const dream::render::Frame& frame = decoder.frame();
++        // TLB2_GFX_V011: match the observed 320x240 PVR mode, not the host target.
++        const auto tlb2_xclip = pvr_.reg(0x068);
++        const auto tlb2_yclip = pvr_.reg(0x06C);
++        const bool tlb2_lowres = tlb2_xclip == 0x013F0000u &&
++                                 tlb2_yclip == 0x00EF0000u;
++        geometry.width = tlb2_lowres ? 320.0f : 640.0f;
++        geometry.height = tlb2_lowres ? 240.0f : 480.0f;
++        // TLB2_GFX_V013: optional vertical alignment trial.
++        geometry.top = (tlb2_lowres && std::getenv("TLB2_ALIGN16")) ? 16.0f : 0.0f;
+         // PT_ALPHA_REF: the punch-through threshold the guest chose, which changes per scene.
+         geometry.alpha_ref = static_cast<float>(pvr_.reg(0x11C) & 0xFFu) / 255.0f;
+         geometry.shadow_scale = static_cast<float>(pvr_.reg(0x074) & 0xFFu) / 256.0f;
+@@ -454,6 +463,12 @@ struct Live {
+         // Palette memory is re-read every render but only invalidates the cache when it has
+         // actually changed, which is rare; dropping it every frame would decode every texture
+         // every frame.
++        // TLB2_GFX_V014: finish previous geometry before evicting any texture.
++        if (!offscreen.wait() || (interpolate && !interp_off.wait())) {
++            std::fprintf(stderr, "TLB2_GPU_WAIT_FAILED\n");
++            return;
++        }
++        renderer.textures().collect_completed();
+         renderer.textures().begin_frame();  // LRU eviction between renders (dreamcomp)
+         // Textures the guest has overwritten since the last render are decoded again (dreamcomp;
+         // Flycast write-protects texture pages for the same reason). DREAM_NO_VRAM_INVALIDATE=1
+@@ -466,6 +481,8 @@ struct Live {
+                         renderer.textures().invalidate_range(begin, end, /*rendered=*/false);
+             });
+         }
++        // No new geometry has been submitted since the fence waits above.
++        renderer.textures().collect_completed();
+         if (renderer.textures().set_palette(pvr_.reg_block() + 0x1000 / 4, palette_format()))
+             ++palette_changes;
+         if (interpolate) {
+diff --git a/translator/src/emit/emit.cpp b/translator/src/emit/emit.cpp
+index 3023ce4..b76a82b 100644
+--- a/translator/src/emit/emit.cpp
++++ b/translator/src/emit/emit.cpp
+@@ -219,9 +219,12 @@ public:
+                     addr += *r0;
+                 }
+                 addr = normalise(addr);
+-                for (std::uint32_t w = addr & ~3u; w < addr + size; w += 4)
++                // VC v0.5: bound iteration by store size, avoiding uint32 wrap loops.
++                for (std::uint32_t offset = 0; offset < size; ++offset) {
++                    const std::uint32_t w = (addr + offset) & ~3u;
+                     if (img_.contains(w, 4))
+                         out.insert(w);
++                }
+             }
+         }
+     }
+@@ -1718,6 +1721,7 @@ EmitResult emit_unit(const Image& image, const std::vector<FunctionSpec>& functi
+             src << "void dream_hook_exit_" << f.hook << "(Ctx& c, Memory& m);\n";
+     }
+     src << "\n";
++    std::fprintf(stderr, "[VC] emit_unit: %zu funciones\n", specs.size());
+     // Pass 0: pool words the unit itself writes (run-time patched literals) are never folded.
+     std::set<std::uint32_t> written;
+     {
+@@ -1728,6 +1732,7 @@ EmitResult emit_unit(const Image& image, const std::vector<FunctionSpec>& functi
+             fe.scan_stores(written);
+         }
+     }
++    std::fprintf(stderr, "[VC] scan_stores completado\n");
+     result.patched_words = written.size();
+     // Callee summaries: iterate to a fixpoint over the call graph. A summary that keeps changing
+     // (recursion through a toggle) is widened to unknown after a few rounds.
+@@ -1755,6 +1760,7 @@ EmitResult emit_unit(const Image& image, const std::vector<FunctionSpec>& functi
+         if (sm.pr == kUnknown || sm.sz == kUnknown)
+             ++result.unknown_summaries;
+     }
++    std::fprintf(stderr, "[VC] resumenes FP completados\n");
+     // Entry modes: seed the functions nobody calls directly with their spec's default, then push
+     // the mode at each call site into the callee and join (disagreement -> unknown) to a fixpoint.
+     {
+@@ -1848,6 +1854,7 @@ EmitResult emit_unit(const Image& image, const std::vector<FunctionSpec>& functi
+                     (f.fpscr_entry & ~(1u << 20)) | (static_cast<std::uint32_t>(e.sz) << 20);
+         }
+     }
++    std::fprintf(stderr, "[VC] modos de entrada completados; emitiendo C++\n");
+     for (const auto& f : specs) {
+         const std::size_t before = result.fp_runtime_branches;
+         FunctionEmitter fe(image, f, options, known, summaries, result);

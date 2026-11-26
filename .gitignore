@@ -1,0 +1,15 @@
+/work/
+/build*/
+*.app/
+*.gdi
+*.chd
+*.bin
+*.BIN
+*.iso
+*.raw
+*.cdi
+*.vmu
+*.dylib
+*.log
+.DS_Store
+source-status.txt
