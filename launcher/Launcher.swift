@@ -91,15 +91,28 @@ final class LauncherViewModel: ObservableObject {
         process.currentDirectoryURL = gameURL
         var args = ["--config", configURL.path, "--window", "--rtc-seed", "12345", "--scale", String(resolution.width / 640)]
         if mode == .fullscreen { args.append("--fullscreen") }
+        let state = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/The Last Blade 2 Recompiled/VMU")
+        do {
+            try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        } catch {
+            message = "No se pudo preparar la memoria VMU: \(error.localizedDescription)"
+            return
+        }
+        args += ["--vmu", state.appendingPathComponent("thelastblade2-v0284.bin").path]
         process.arguments = args
 
         var env = ProcessInfo.processInfo.environment
         for key in ["TLB2_ALIGN16", "DREAM_NO_TILE_CLIP", "TLB2_NO_BYTE_COMPARE", "TLB2_NO_RECYCLE", "DREAM_NO_VRAM_INVALIDATE", "TLB2_NO_BATCH", "TLB2_LRU_EXPANDED", "TLB2_SCANLINES"] { env.removeValue(forKey: key) }
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
         env["TLB2_SCANLINES"] = String(preset.darkness * intensity / 100.0)
+        let icd = bundleURL.appendingPathComponent("Contents/Resources/MoltenVK_icd.json")
+        if FileManager.default.fileExists(atPath: icd.path) {
+            env["VK_DRIVER_FILES"] = icd.path
+            env["VK_ICD_FILENAMES"] = icd.path
+        }
         process.environment = env
         let data = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/The Last Blade 2 Recompiled/Logs")
-        let log = data.appendingPathComponent("v026-" + UUID().uuidString + ".txt")
+        let log = data.appendingPathComponent("v0284-" + UUID().uuidString + ".txt")
         do {
             try FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
             try Data().write(to: log)
@@ -219,7 +232,7 @@ struct ContentView: View {
                     Text("Dreamcast → macOS ARM64")
                         .font(.system(size: 22, weight: .medium, design: .serif))
                         .foregroundStyle(Color.white.opacity(0.9))
-                    Text("Motor v0.23 estable · Portable v0.26")
+                    Text("Motor v0.28.3 estable · Portable v0.28.4")
                         .font(.system(size: 14, weight: .regular, design: .serif))
                         .foregroundStyle(Color.white.opacity(0.78))
                 }
@@ -336,7 +349,7 @@ struct ContentView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     Divider().overlay(Color(red: 0.74, green: 0.60, blue: 0.34).opacity(0.8))
-                    Text("Motor v0.23 estable  |  Launcher v0.26")
+                    Text("Motor v0.28.3 estable  |  Launcher v0.28.4")
                         .font(.system(size: 14, weight: .regular, design: .serif))
                         .foregroundStyle(Color(red: 0.95, green: 0.90, blue: 0.82).opacity(0.95))
                     Text("Dreamcast → macOS ARM64")
@@ -390,7 +403,7 @@ struct ContentView: View {
                     .font(.system(size: 28, weight: .bold, design: .serif))
                 Text("The Last Blade 2 Recompiled")
                     .font(.system(size: 14, weight: .semibold, design: .serif))
-                Text("Motor estable v0.23 · Launcher Edition v0.26")
+                Text("Motor estable v0.28.3 · Launcher Edition v0.28.4")
                 Text("Dreamcast → macOS ARM64")
                 Text("Recompilación y adaptación: EddyKine. Juego original: SNK. Ilustración del lanzador creada para este proyecto.")
                     .font(.system(size: 15))

@@ -21,3 +21,7 @@ F1 or controller Select: bindings; Esc: quit. CRT Original/Soft/Medium and inten
 ## Attribution and licensing
 
 See upstream-url.txt, upstream-commit.txt and the upstream license copied during export. Preserve all upstream notices and comply with its terms. Do not publish the patch if upstream licensing does not permit it; audit the diff and dependencies first. No permission is granted for SNK game data. The generated local application containing the user's game must not be committed or uploaded. Third-party dynamic libraries require their own license notices if redistributed. This source repository installs dependencies from their upstream package sources rather than redistributing their binaries.
+
+## v0.28.4 corrections
+
+Adds SH-4 discovery entries `0x0C133056` (fresh VMU startup) and `0x0C077590` (Options menu). The original v0.28.3 motor was tested on Apple M4 in Options, Training, Arcade, Versus and after restarting with saved preferences. Both motors use a dedicated persistent VMU. Clean-machine builds and cross-Mac portability remain unverified.

@@ -71,7 +71,7 @@ if [[ -f "$HERE/../Resources/MoltenVK_icd.json" ]]; then
 fi
 exec "$HERE/TLB2Launcher" "$@"
 '''); wrapper.chmod(0o755)
-info=c/'Info.plist'; d=plistlib.loads(info.read_bytes()); d['CFBundleExecutable']='StartPortable'; d['CFBundleShortVersionString']='0.27'; d['CFBundleVersion']='27'; d['CFBundleIdentifier']=d['CFBundleIdentifier']+'.distribution'; info.write_bytes(plistlib.dumps(d))
+info=c/'Info.plist'; d=plistlib.loads(info.read_bytes()); d['CFBundleExecutable']='StartPortable'; d['CFBundleShortVersionString']='0.28.4'; d['CFBundleVersion']='284'; d['CFBundleIdentifier']=d['CFBundleIdentifier']+'.distribution'; info.write_bytes(plistlib.dumps(d))
 S.check_call(['codesign','--force','--sign','-',str(mac/'TLB2Launcher')])
 S.check_call(['codesign','--force','--sign','-',str(app)]); S.check_call(['codesign','--verify','--deep','--strict',str(app)])
 print('Relocation complete; test on a clean Mac before declaring standalone.')
